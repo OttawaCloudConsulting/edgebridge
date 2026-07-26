@@ -1,10 +1,22 @@
 name: Release
 
-# Releases are cut by tagging on main. Development happens on develop, which
-# only ever produces the unpushed CI build.
+# Two ways in:
+#   * workflow_dispatch - pick a version in the Actions UI and this cuts the tag
+#     for you, after validation passes.
+#   * pushing a v* tag by hand, which still works.
+#
+# The tag is created by the publish job rather than by a separate workflow: a tag
+# pushed using GITHUB_TOKEN does not trigger further workflows, so a "tag now,
+# build later" split would simply never build.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 1.0.0 (the v prefix is optional)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,21 +26,46 @@ env:
 
 jobs:
   guard:
-    name: Verify tag is on main
+    name: Resolve and check the version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Reject tags that are not merged to main
+      - name: Resolve the version
+        id: resolve
+        env:
+          RAW_VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          VERSION="v${RAW_VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not semver (expected vMAJOR.MINOR.PATCH[-prerelease])"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      - name: Refuse anything not on main
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
-            echo "::error::tag ${{ github.ref_name }} is not an ancestor of main; releases are cut from main only"
+            echo "::error::${{ github.sha }} is not on main; releases are cut from main only"
             exit 1
           fi
-          echo "tag ${{ github.ref_name }} is on main"
+
+      - name: Refuse a version that already exists
+        # On a tag push the tag necessarily exists already - it is what started
+        # this run - so only guard the dispatch path.
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if git ls-remote --exit-code --tags origin \
+               "refs/tags/${{ steps.resolve.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag ${{ steps.resolve.outputs.version }} already exists"
+            exit 1
+          fi
 
   validate:
     needs: guard
@@ -53,13 +90,26 @@ jobs:
           docker run --rm -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" git . -v
 
   publish:
-    needs: validate
+    needs: [guard, validate]
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # to create the GitHub Release
-      packages: write   # to push to GHCR
+      contents: write   # create the tag and the GitHub Release
+      packages: write   # push to GHCR
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Deliberately after validate: never tag a commit that failed its checks.
+      - name: Create and push the tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -75,14 +125,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # value= is what makes the semver patterns work on a dispatch run,
+          # where the ref is a branch rather than a tag.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ needs.guard.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.guard.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.guard.outputs.version }}
             type=sha,format=long
           # A prerelease (v1.1.0-rc.1) must not take over 'latest'.
           flavor: |
-            latest=${{ !contains(github.ref_name, '-') }}
+            latest=${{ !contains(needs.guard.outputs.version, '-') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -94,16 +146,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=${{ needs.guard.outputs.version }}
             REVISION=${{ github.sha }}
           cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Create GitHub Release
+      - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --generate-notes \
-            --title "${{ github.ref_name }}" \
-            --notes-start-tag "$(git describe --tags --abbrev=0 "${{ github.ref_name }}^" 2>/dev/null || echo '')" \
-          || gh release create "${{ github.ref_name }}" --generate-notes --title "${{ github.ref_name }}"
+          FLAGS=""
+          case "$VERSION" in *-*) FLAGS="--prerelease" ;; esac
+          gh release create "$VERSION" --generate-notes --title "$VERSION" $FLAGS
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published \`$VERSION\`"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

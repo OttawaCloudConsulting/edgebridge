@@ -3,7 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [develop]
+    # main is included so a merge or a direct commit is validated on arrival.
+    # Without it, a merge commit matches no trigger and main sits unverified
+    # until someone cuts a release.
+    branches: [main, develop]
 
 permissions:
   contents: read

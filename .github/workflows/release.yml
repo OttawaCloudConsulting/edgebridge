@@ -85,9 +85,14 @@ jobs:
       - run: pytest
 
       - name: Betterleaks - working tree and history
+        # --user matters: as root the container's uid does not match the
+        # checkout's owner, and the git scan aborts with "detected dubious
+        # ownership in repository at '/scan'".
         run: |
-          docker run --rm -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" dir . -v
-          docker run --rm -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" git . -v
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" dir . -v
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" git . -v
 
   publish:
     needs: [guard, validate]

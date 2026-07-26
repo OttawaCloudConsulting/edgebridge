@@ -1,54 +1,51 @@
-# EdgeBridge Docker-Compose Support
+# EdgeBridge Docker Support
 
 ## Overview
 
-Integration with Docker was created to enable simple support for long-term running of the python server.
+Running edgebridge in a container keeps it alive across reboots without a systemd unit.
 
-The provided `Dockerfile` builds a Python 3 image, copies the python script, edgebridge configuration file and requirements.txt to run the service.
+The image is built from the `Dockerfile` **in the repository root**. Earlier versions kept a second Dockerfile in this directory, which forced you to copy `edgebridge.py` and `requirements.txt` up into `docker/` before every build. That is no longer necessary — the compose file sets the build context to the repository root.
 
-In our example we are deploying using docker-compose to a specific docker network, that runs in a specific 'smarthome' CIDR block.
+## Configuration
 
-For building and analyzing responses with the Smartthings API, we recommend using the `jq` package - https://stedolan.github.io/jq/
+Your SmartThings bearer token is **never built into the image**. It is supplied at runtime by mounting a config file at `/etc/edgebridge/edgebridge.cfg`.
 
-### Configuration
-
-#### Building the Docker Image (optional)
-
-**FIRST COPY THE edgebridge.py and requirements.txt files into the ./docker directory as docker build cannot see parent folders**
-
-To build the docker image, update the `edgebridge.cfg` file first, replacing the "" with your Smartthings Bearer Token obtained from the instructions in the EdgeBridge root documentation.
-
-Building the image is not required with the provided example docker-config file, which already contains a build command
-
-```
-[config]
-Server_Port = 8088
-SmartThings_Bearer_Token = ""
+```sh
+cp edgebridge.cfg.example edgebridge.cfg
+# edit edgebridge.cfg and add your token
 ```
 
-Build the image:
+`docker/edgebridge.cfg` is gitignored, so the filled-in copy cannot be committed by accident. Only `edgebridge.cfg.example`, which contains placeholders, is tracked.
 
-```
-docker build .
-```
+## Running
 
-##### Docker-Compose
-
-**FIRST COPY THE edgebridge.py and requirements.txt files into the ./docker directory as docker build cannot see parent folders**
-
-To deploy using docker-compose, simply provide the IP Address Subnet for the network you use, the default gateway (router) IP Address, DNS Server (router) and IP Address.
-
-There is a commented out data volume mount example, if you prefer to externalize your configuration file rather than build it.
-
-To start the service:
+From this directory:
 
 ```sh
 docker-compose up -d --build
 ```
 
-You can test with a simple list command, that will output all of your Smartthings devices in JSON format:
+Update the compose file with your subnet, gateway, DNS server, and the LAN IP address you want edgebridge to answer on. A static address matters because Edge drivers register a fixed edgebridge address.
 
-```
-curl --request GET "http://10.40.1.18:8088/api/forward?url=https://api.smartthings.com/v1/devices"
+Test it by listing your SmartThings devices through the bridge:
+
+```sh
+curl "http://192.168.1.88:8088/api/forward?url=https://api.smartthings.com/v1/devices"
 ```
 
+The [`jq`](https://stedolan.github.io/jq/) tool is useful for reading the JSON that comes back.
+
+## Health check
+
+The image defines a `HEALTHCHECK` against `GET /healthz`. It probes port 8088 by default; if your config sets a different `Server_Port`, set `EDGEBRIDGE_HEALTH_PORT` to match or the container will report unhealthy while serving normally.
+
+## Container details
+
+- Runs as non-root (uid 10001)
+- Config is read from `/etc/edgebridge/edgebridge.cfg` (mount read-only)
+- The `.registrations` state file is written to `/var/lib/edgebridge`, which must be writable — use a volume or tmpfs if you run with `--read-only`
+- Handles `SIGTERM`, so `docker stop` returns immediately instead of waiting out the grace period
+
+## Kubernetes
+
+See [`k8s/`](../k8s/) for reference manifests, including the Service settings needed to preserve client source IPs.

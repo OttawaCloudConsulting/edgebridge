@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgebridge
+  labels:
+    app.kubernetes.io/name: edgebridge
+spec:
+  # Registrations are held in memory and persisted to a per-pod emptyDir, and
+  # devices are matched by source IP. More than one replica means a device's
+  # message reaches whichever pod it lands on, which may not be the one holding
+  # that registration. Keep this at 1 unless you add shared state.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: edgebridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: edgebridge
+      annotations:
+        # Config is read once at startup. Rolling this annotation (or running
+        # `kubectl rollout restart`) is what makes a rotated token take effect.
+        checksum/config: "replace-me-with-the-secret-checksum"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: edgebridge
+          image: ghcr.io/ottawacloudconsulting/edgebridge:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8088
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            # Mounted as a directory, deliberately not with subPath: subPath
+            # mounts never receive updates when the Secret changes.
+            - name: config
+              mountPath: /etc/edgebridge
+              readOnly: true
+            # The config mount is read-only, so .registrations needs its own
+            # writable location. This is also what makes readOnlyRootFilesystem
+            # workable.
+            - name: state
+              mountPath: /var/lib/edgebridge
+      volumes:
+        - name: config
+          secret:
+            # Created by the SealedSecret in the project repo. The key must be
+            # named edgebridge.cfg so it lands at /etc/edgebridge/edgebridge.cfg.
+            secretName: edgebridge-config
+            defaultMode: 0400
+            items:
+              - key: edgebridge.cfg
+                path: edgebridge.cfg
+        - name: state
+          emptyDir: {}
+      terminationGracePeriodSeconds: 15

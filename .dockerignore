@@ -1,0 +1,29 @@
+# Keep credentials and bulk out of the build context. edgebridge.cfg in
+# particular must never reach the image - it is mounted at runtime.
+edgebridge.cfg
+docker/edgebridge.cfg
+.registrations
+*.log
+
+.git
+.github
+.gitignore
+tests/
+k8s/
+docker/
+CLAUDE.md
+README.md
+LICENSE
+pyproject.toml
+requirements-dev.txt
+
+# Prebuilt release binaries - large and irrelevant to the image
+edgebridge.exe
+edgebridge4pi
+edgebridge4pi64
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.ruff_cache/

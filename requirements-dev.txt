@@ -1,0 +1,7 @@
+-r requirements.txt
+pytest>=8,<9
+pytest-cov>=5
+responses>=0.25
+# Pinned to a minor range: the lint rule set is fixed in pyproject.toml, but a
+# pinned tool keeps local and CI results identical.
+ruff>=0.14,<0.15

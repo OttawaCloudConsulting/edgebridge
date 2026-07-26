@@ -1,5 +1,5 @@
 #
-# Copyright 2021 Todd Austin
+# Copyright 2021, 2022, 2023 Todd Austin
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
 # except in compliance with the License. You may obtain a copy of the License at:
@@ -22,18 +22,21 @@
 # Reads 'edgebridge.conf' user config file for configuration options (server port, SmartThings Token)
 # Creates and updates '.registrations' file for maintaining Edge driver registration list
 #
-VERSION = '1.2231072320'
+VERSION = '1.2318101200'
 
 import http.server
 import datetime
 import time
 import socket
-from typing import TYPE_CHECKING
 import requests
 import os
 import platform
 import configparser
 import json
+import ipaddress
+import argparse
+import signal
+import threading
 
 registrations = []
 hubsenderrors = {}
@@ -42,27 +45,167 @@ regdeletelist = []
 HTTP_OK = 200
 CONFIGFILENAME = 'edgebridge.cfg'
 REGSFILENAME = '.registrations'
+LOGFILE = 'edgebridge.log'
 MAXPORT = 65535
 TOKEN_LENGTH = 36
 DEFAULT_SERVERPORT = 8088
 DEFAULT_ST_TOKEN = ''
 SERVER_PORT = DEFAULT_SERVERPORT
 SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
+FWTIMEOUT = 5
+
+# Set once from the command line; read by logger.debug on every call
+DEBUG = False
+
+# Directory the '.registrations' file is written to. Kept separate from the config
+# path so the config can be mounted read-only (e.g. a Kubernetes Secret volume)
+# while state still lands somewhere writable.
+STATE_DIR = '.'
+
+# Health endpoint for container orchestrators. GET only, unlogged, and matched
+# before registration lookup so a probe from a registered source IP is never
+# forwarded to a hub.
+HEALTH_PATHS = ('/healthz', '/readyz')
+
+REDACTED = '<redacted>'
+SENSITIVE_HEADERS = ('authorization', 'proxy-authorization')
+
+
+class logger(object):
+    
+    def __init__(self, toconsole, tofile, fname, append):
+    
+        self.toconsole = toconsole
+        self.savetofile = tofile
+
+        self.os = platform.system()
+        if self.os == 'Windows':
+            os.system('color')
+        
+        if tofile:
+            self.filename = fname
+            if not append:
+                try:
+                    os.remove(fname)
+                except:
+                    pass
+            
+    def __savetofile(self, msg):
+
+        try:
+            with open(self.filename, 'a') as f:
+                f.write(f'{time.strftime("%c")}  {msg}\n')
+        except OSError as e:
+            # Logging must never take the server down. Fall back to console only
+            # and report once, rather than raising on every subsequent message.
+            self.savetofile = False
+            self.toconsole = True
+            print(f'\033[91mLog file {self.filename!r} is not writable ({e.__class__.__name__}); '
+                  f'continuing with console output only\033[0m', flush=True)
+            # __outputmsg has already decided whether to print, and with console
+            # output disabled it skipped this message before calling us. Emit it
+            # here so the message that triggered the failure is not lost.
+            print(f'{time.strftime("%c")}  {msg}', flush=True)
+    
+    def __outputmsg(self, colormsg, plainmsg):
+
+        if self.toconsole:
+            print (colormsg, flush=True)
+        if self.savetofile:
+            self.__savetofile(plainmsg)
+    
+    def info(self, msg):
+        colormsg = f'\033[33m{time.strftime("%c")}  \033[96m{msg}\033[0m'
+        self.__outputmsg(colormsg, msg)
+        
+    def warn(self, msg):
+        colormsg = f'\033[33m{time.strftime("%c")}  \033[93m{msg}\033[0m'
+        self.__outputmsg(colormsg, msg)
+        
+    def error(self, msg):
+        colormsg = f'\033[33m{time.strftime("%c")}  \033[91m{msg}\033[0m'
+        self.__outputmsg(colormsg, msg)
+        
+    def hilite(self, msg):
+        colormsg = f'\033[33m{time.strftime("%c")}  \033[97m{msg}\033[0m'
+        self.__outputmsg(colormsg, msg)
+        
+    def debug(self, msg):
+        if DEBUG:
+            colormsg = f'\033[33m{time.strftime("%c")}  \033[37m{msg}\033[0m'
+            self.__outputmsg(colormsg, msg)
+
+
+def redact_headers(headers):
+    """Copy of 'headers' with credential values masked, for safe logging.
+
+    proc_forward attaches the SmartThings bearer token to outbound requests;
+    without this the token would be written verbatim to the debug log.
+    """
+    return {key: (REDACTED if key.lower() in SENSITIVE_HEADERS else value)
+            for key, value in headers.items()}
+
+
+def parse_args(argv=None):
+
+    parser = argparse.ArgumentParser(
+        prog='edgebridge',
+        description='Forwarding bridge server for SmartThings Edge drivers')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='enable debug-level logging')
+    parser.add_argument('-c', '--config', default=CONFIGFILENAME,
+                        help=f'path to the config file (default: ./{CONFIGFILENAME})')
+    parser.add_argument('-s', '--state-dir', default='.',
+                        help=f'writable directory for the {REGSFILENAME} file (default: current directory)')
+
+    return parser.parse_args(argv)
 
 
 def http_response(server, code, responsetosend):
     
     try:
         server.send_response(code)
-        server.send_header("CONTENT-TYPE", 'text/xml; charset="utf-8"')
-        server.send_header("DATE", datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT"))
-        server.send_header("SERVER", 'edgeBridge')
-        server.send_header("CONTENT-LENGTH", str(len(responsetosend)))
+        if len(responsetosend) > 0:
+            server.send_header("Content-Type", 'text/xml; charset="utf-8"')
+            server.send_header("Content-Length", str(len(bytes(responsetosend, 'UTF-8'))))
+        server.send_header("Date", datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        server.send_header("Server", 'edgeBridge')
+        
         server.end_headers()
                 
         server.wfile.write(bytes(responsetosend, 'UTF-8'))
+        log.debug ('Response sent')
     except:
-        print (f'\033[91mHTTP Send error sending response: {responsetosend}\033[0m')
+        log.error (f'HTTP Send error sending response: {responsetosend}')
+    
+
+def build_headers(server, path):
+
+    headers = {}
+
+    ignored = ['user-agent', 'host', 'te', 'connection']
+
+    for key, value in server.headers.items():
+        if key.lower() not in ignored:
+            headers[key] = value
+
+    if 'api.smartthings.com' in path:
+        if 'authorization' not in map(str.lower, server.headers.keys()):
+            if len(SMARTTHINGS_TOKEN) > 0:
+                headers['Authorization'] = SMARTTHINGS_TOKEN
+        
+    headers['Host'] = path.split('//')[1].split('/')[0]
+    
+    if 'accept' not in map(str.lower, server.headers.keys()):
+        headers['Accept'] = '*/*'
+        
+    headers['User-Agent'] = 'SmartThings Edge Hub'
+    
+    if server.data_bytes != None:
+        if len(server.data_bytes) > 0:
+            headers['Content-Length'] = str(len(server.data_bytes))
+        
+    return headers
     
 
 def proc_forward (server, method, path, arg):
@@ -71,35 +214,49 @@ def proc_forward (server, method, path, arg):
 
     if arg.startswith('url='):
         url = path[path.index('url=')+4:]
-        print (f'Sending {method} to {url}')
+        log.info (f'Sending {method} to {url}')
         
-        if 'api.smartthings.com' in path:
-            headers['Authorization'] = SMARTTHINGS_TOKEN
+        headers = build_headers(server, path)
+                
+        log.debug (f'Headers: {redact_headers(headers)}')
+        if server.data_bytes:
+            log.debug (f'Body: {server.data_bytes.decode("utf-8")}')
         
-        headers['Host'] = path.split('//')[1].split('/')[0]
-        headers['Accept'] = '*/*'
-        headers['User-Agent'] = 'SmartThings Edge Hub'
-        
+        lc_method = method.lower()
+        if lc_method not in ['post', 'put', 'get']:
+            log.error (f'Unsupported method for forward command: {method}')
+            http_response(server, 405, "")
+            return
+
         try:
-            if method in ['post', 'Post', 'POST']:
-                r = requests.post(url, data='', headers=headers, timeout=5)
-            elif method in ['get', 'Get', 'GET']:
-                r = requests.get(url, data='', headers=headers, timeout=5)
+            r = getattr(requests, lc_method)(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
         except requests.Timeout:
-            print ("Internet request timed out")
+            log.error ("Internet request timed out")
             http_response(server, 502, "")
             return
-            
+        except requests.RequestException as e:
+            # Anything else the request layer can raise - DNS failure, connection
+            # refused, TLS error. Without this the exception escapes the handler
+            # and the Edge driver never receives a response at all.
+            # Only the exception type is logged: the message embeds the URL,
+            # which may carry credentials in its query string.
+            log.error (f'Forwarding request failed: {e.__class__.__name__}')
+            http_response(server, 502, "")
+            return
+
+
         if r.status_code == HTTP_OK:
-            print ('Returned data:\n', r.text)
+            
+            log.debug (f'Returned data: {r.text}')
             http_response(server, 200, r.text)
+            log.info (f'Response returned to Edge driver (bytes len={len(bytes(r.text, "UTF-8"))})')
             
         else:
-            print (f'\033[91mHTTP error returned: {r.status_code}\033[0m')
+            log.warn (f'HTTP error returned: {r.status_code}')
             http_response(server, r.status_code, "")
             
     else:
-        print ('\033[91mMissing URL from forward command\033[0m')
+        log.error ('Missing URL from forward command')
         http_response(server, 400, "")
 
 
@@ -136,18 +293,25 @@ def passto_hub(server, regrecord):
 
         url = 'http://' + hubaddr + '/' + devaddr + '/' + server.command + server.path
         headers['Host'] = hubaddr
+        
+        if server.data_bytes != None:
+            if len(server.data_bytes) > 0:
+                headers['Content-Length'] = str(len(server.data_bytes))
+                if 'Content-Type' in server.headers:
+                    headers['Content-Type'] = server.headers['Content-Type']
+                
 
-        print (f'Sending POST: {url} to {hubaddr}')
+        log.info (f'Sending POST: {url} to {hubaddr}')
 
         try:
-            r = requests.post(url, headers=headers, data='')
+            r = requests.post(url, headers=headers, data=server.data_bytes, timeout=FWTIMEOUT)
 
             if r.status_code == 200:
-                print (f"Message forwarded to Edge ID {regrecord['edgeid']}")
+                log.info (f"Message forwarded to Edge ID {regrecord['edgeid']}")
             else:
-                print (f"\033[91mERROR sending message to Edge hub {regrecord['hubaddr']}: {str(r.status_code)}\033[0m")
+                log.error (f"ERROR sending message to Edge hub {regrecord['hubaddr']}: {str(r.status_code)}")
         except:
-            print (f"\033[91mFAILED sending message to Edge hub {regrecord['hubaddr']}\033[0m")
+            log.error (f"FAILED sending message to Edge hub {regrecord['hubaddr']}")
             error_proc(regrecord['hubaddr'])
 
 def verify_addr(addrstr):
@@ -161,9 +325,9 @@ def verify_addr(addrstr):
         addrparts = addrstr.split(':')
         ip = addrparts[0]
         port = int(addrparts[1])
-        print (f'Port={port}')
+        #print (f'Port={port}')
         if (port < 1) or (port > MAXPORT):
-            print (f'\033[91mInvalid port number: {port}\033[0m')
+            log.error (f'Invalid port number: {port}')
             return False
 
     else:
@@ -180,9 +344,10 @@ def verify_addr(addrstr):
 
                     return (ip, port)
             except:
-                print (f'\033[91mInvalid IP address syntax: {ipparts}\033[0m')
+                log.error (f'Invalid IP address syntax: {ipparts}')
                 NotImplemented
-    print (f'\033[91mInvalid IP address: {ip}\033[0m')
+                
+    log.error (f'Invalid IP address: {ip}')
     return False
 
 
@@ -217,7 +382,7 @@ def find_reg(reglist, devaddr, edgeid):
 
 def read_regs(regs_filename):
 
-    file_path = os.getcwd() + os.path.sep + regs_filename
+    file_path = os.path.join(STATE_DIR, regs_filename)
 
     try:
         with open(file_path,"r") as f1:
@@ -229,19 +394,19 @@ def read_regs(regs_filename):
             return reglist
             
     except:
-        print ('INFO: No existing registrations')
+        log.warn ('INFO: No existing registrations')
         return []
 
 def write_regs(regs_filename, reglist):
 
-    file_path = os.getcwd() + os.path.sep + regs_filename
+    file_path = os.path.join(STATE_DIR, regs_filename)
 
     try:
         with open(file_path, 'w') as f1:
             for reg in reglist:
                 f1.write(json.dumps(reg)+'\n')
     except:
-        print ('\033[91mError saving registrations\033[0m')
+        log.error ('Error saving registrations')
 
 
 def proc_register(server, method, arglist):
@@ -254,7 +419,7 @@ def proc_register(server, method, arglist):
         elif arg.startswith('edgeid='):
             edgeid = verify_ID(arg[7:])
         else:
-            print ('\033[91mUnrecognized argument in register command\033[0m')
+            log.error ('Unrecognized argument in register command')
             http_response(server, 400, "")
             return
 
@@ -263,40 +428,43 @@ def proc_register(server, method, arglist):
         index = find_reg(registrations, devaddr, edgeid)
 
         if method in ['post', 'Post', 'POST']:
-            print (f'Request to register device at {devaddr}')
+            log.info (f'Request to register device at {devaddr}')
             
             if index == None:
                 registrations.append({'devaddr': devaddr, 'edgeid': edgeid, 'hubaddr': hubaddr})
-                print ('Registration record ADDED')
+                log.info ('Registration record ADDED')
                
             else:
                 registrations[index] = {'devaddr': devaddr, 'edgeid': edgeid, 'hubaddr': hubaddr}
-                print ('Existing registration was REPLACED')
+                log.info ('Existing registration was REPLACED')
 
             http_response(server, 200, "")
             
         elif method in ['delete', 'Delete', 'DELETE']:
-            print (f'Request to remove registration {devaddr}')
+            log.info (f'Request to remove registration {devaddr}')
 
             if index != None:
                 del registrations[index]
-                print (f'Registration {index} DELETED')
+                log.info (f'Registration {index} DELETED')
                 http_response(server, 200, "")
             else:
-                print (f'Request to remove address that is not registered: {devaddr}')
+                log.warn (f'Request to remove address that is not registered: {devaddr}')
                 http_response(server, 404, "")
         else:
-            print (f'\033[91mInvalid method provided ({method}) for register command\033[0m')
+            log.error (f'Invalid method provided ({method}) for register command')
             http_response(server, 405, "")
     else:
-        print ('\033[91mMissing argument(s) in register command\033[0m')
+        log.error ('Missing argument(s) in register command')
         http_response(server, 400, "")
     
-    print (f'Updated registrations: {registrations}')
+    log.info (f'Updated registrations: {registrations}')
     write_regs(REGSFILENAME, registrations)
 
 
-def handle_requests(server, method, path, devaddraddr_tuple):
+def handle_requests(server):
+    
+    method = server.command
+    path = server.path
 
     if '?' in path:
         arg = path.split('?')
@@ -312,16 +480,16 @@ def handle_requests(server, method, path, devaddraddr_tuple):
                     proc_register(server, method, arglist)
                     
                 else:
-                    print ('\033[91mInvalid endpoint\033[0m')
+                    log.warn ('Invalid endpoint')
                     http_response(server, 404, "")
             else:
-                print ('\033[91mNot an API request\033[0m')
+                log.error ('Not an API request')
                 http_response(server, 404, "")
         else:
-            print ('\033[91mInvalid endpoint\033[0m')
+            log.error ('Invalid endpoint')
             http_response(server, 400, "")
     else:
-        print ('\033[91mInvalid endpoint\033[0m')
+        log.error ('Unregistered address or Invalid endpoint')
         http_response(server, 400, "")
 
 
@@ -342,7 +510,7 @@ def proc_registered_requests(server):
                     match = False
             if match:
                 regfound = True
-                print('\n>>>>> Forwarding to SmartThings hub')
+                log.info('>>>>> Forwarding to SmartThings hub')
                 passto_hub(server, record)
                 
     if regfound:
@@ -351,7 +519,7 @@ def proc_registered_requests(server):
         # update registration list if exceeded pass-to-hub error threshold for any of the registration records
         # -- this ensures that old no-longer-used ip:port hub addresses get scrubbed from list
         for item in regdeletelist:   
-            print (f'\nScrubbing registration record: {item}')   
+            log.info (f'Scrubbing registration record: {item}')   
             registrations.remove(item)
                 
         if len(regdeletelist) > 0:
@@ -362,67 +530,145 @@ def proc_registered_requests(server):
     
     else:
         return False
+        
+        
+def proc_msg(server):
+        
+    log.info ('**********************************************************************************')
+    log.info (f'{server.command} request received from: {server.client_address}')
+    log.debug (f'Endpoint: {server.path}')
+    
+    server.data_bytes = None
+    if 'Content-Length' in server.headers:
+        server.data_bytes = server.rfile.read(int(server.headers['Content-Length']))
+        
+    if not proc_registered_requests(server):
+        handle_requests(server)
+
 
 class myHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
-        print ('\n**********************************************************************************')
-        print ('\033[93m' + time.strftime("%c") + f'\033[0m  {self.command} command received from: {self.client_address}')
-        print ('Endpoint: ', self.path)
         
-        if not proc_registered_requests(self):
+        # If a ping, just send response and don't display any messages
+        if '/api/ping' in self.path:
+            log.debug ('Pingreq')
+            http_response(self, 200, "")
+            return
         
-            handle_requests(self, 'POST', self.path, self.client_address)
+        else:
+            proc_msg(self)
+            
+            
+    def do_PUT(self):
+        
+        proc_msg(self)
         
         
     def do_GET(self):
-        print ('\n**********************************************************************************')
-        print ('\033[93m' + time.strftime("%c") + f'\033[0m  {self.command} command received from: {self.client_address}')
-        print ('Endpoint: ', self.path)
-        #print ('Headers:\n', self.headers)
-        #if ('Content-Length' in self.headers) or ('CONTENT-LENGTH' in self.headers):
-        #    self.data_string = self.rfile.read(int(self.headers['Content-Length']))
-        #    print ('Data:\n',self.data_string)
-        #print ('- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -')
-        
-        if not proc_registered_requests(self):
-            
-            handle_requests(self, 'GET', self.path, self.client_address)
+
+        # Health probe. Matched before proc_msg so that a probe originating from
+        # an IP that happens to be a registered device is not relayed to a hub.
+        if self.path.split('?')[0] in HEALTH_PATHS:
+            http_response(self, 200, "")
+            return
+
+        proc_msg(self)
 
 
     def do_DELETE(self):
-        print ('\n**********************************************************************************')
-        print ('\033[93m' + time.strftime("%c") + f'\033[0m  {self.command} command received from: {self.client_address}')
-        print ('Endpoint: ', self.path)
         
-        handle_requests(self, 'DELETE', self.path, self.client_address)
+        proc_msg(self)
+        
+
+    def log_message(self, format, *args):
+        return
 
 
-def process_config(config_filename):
+def process_config(config_path):
 
     global SERVER_PORT
+    global SERVER_IP
     global SMARTTHINGS_TOKEN
+    global FWTIMEOUT
+    global log
 
-    CONFIG_FILE_PATH = os.getcwd() + os.path.sep + config_filename
+    SERVER_IP = ''
+    SERVER_PORT = DEFAULT_SERVERPORT
+    SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
+    conoutp = True
+    logoutp = False
+    LOGFILE = ''
+
+    CONFIG_FILE_PATH = config_path
 
     parser = configparser.ConfigParser()
     if parser.read(CONFIG_FILE_PATH):
-        config_port = int(parser.get('config', 'Server_Port'))
-        if (config_port > 0) and (config_port <= MAXPORT):
-            SERVER_PORT = config_port
-        else:
-            print (f'\033[31mInvalid port from config file; using default: {DEFAULT_SERVERPORT}\033[0m')
         
-        config_token = parser.get('config', 'SmartThings_Bearer_Token')
-        if len(config_token) == TOKEN_LENGTH:
-            SMARTTHINGS_TOKEN = 'Bearer ' + config_token
-        else:
-            print('\033[31mInvalid SmartThings Token from config file; assumed None\033[0m')
-            SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
-    else:
-        SERVER_PORT = DEFAULT_SERVERPORT
-        SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
+        try:
+            config_ip = parser.get('config', 'Server_IP')
+            try:
+                config_ip = ipaddress.ip_address(parser.get('config', 'Server_IP'))
+                SERVER_IP = config_ip
+            except ValueError:
+                print (f'\n\033[93mInvalid Server IP address in config file; using detected IP\033[0m\n')
+            
+        except:
+            pass
+        
+        try:
+            config_port = int(parser.get('config', 'Server_Port'))
+            if (config_port > 0) and (config_port <= MAXPORT):
+                SERVER_PORT = config_port
+            else:
+                print (f'\033[31mInvalid port from config file; using default: {DEFAULT_SERVERPORT}\033[0m')
+        except:
+            print (f'\033[31mMissing port from config file; using default: {DEFAULT_SERVERPORT}\033[0m')
+            
+        try:
+            config_token = parser.get('config', 'SmartThings_Bearer_Token')
+            if len(config_token) == TOKEN_LENGTH:
+                SMARTTHINGS_TOKEN = 'Bearer ' + config_token
+            else:
+                print('\033[31mInvalid SmartThings Token from config file; assumed None\033[0m')
+                SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
+        except:
+            pass
+           
+        try:    
+            if parser.get('config', 'forwarding_timeout'):
+                FWTIMEOUT = int(parser.get('config', 'forwarding_timeout'))
+        except:
+            pass
+        
+        try:
+            if parser.get('config', 'console_output').lower() == 'yes':
+                conoutp = True
+            else:
+                conoutp = False
 
+            if parser.get('config', 'logfile_output').lower() == 'yes':
+                # Only enable file logging once a usable path has actually been
+                # read. Setting the flag first meant a missing 'logfile' key
+                # left an empty filename behind, and the first log message then
+                # killed the process on open('').
+                LOGFILE = parser.get('config', 'logfile', fallback='').strip()
+                logoutp = bool(LOGFILE)
+                if not logoutp:
+                    print ('\033[93mlogfile_output is enabled but no logfile was specified; '
+                           'using console output only\033[0m')
+                    conoutp = True
+            else:
+                logoutp = False
+                LOGFILE = ''
+        except:
+            print ('Using output config defaults')
+            conoutp = True
+            logoutp = False
+            LOGFILE = ''
+            
+    log = logger(conoutp, logoutp, LOGFILE, False)
+    
 
 #################################################################################################
 ##                  MAINLINE
@@ -431,32 +677,70 @@ def process_config(config_filename):
 if __name__ == '__main__':
 
     thisOS = platform.system()
-    print (f'O/S = {thisOS}')
+    #print (f'O/S = {thisOS}')
     if thisOS == 'Windows':
         os.system('color')              # force color text to work in Windows
 
-    process_config(CONFIGFILENAME)
+    args = parse_args()
+    DEBUG = args.debug
+    STATE_DIR = args.state_dir
+
+    process_config(args.config)
     registrations = read_regs(REGSFILENAME)
 
     HandlerClass = myHTTPRequestHandler
-    ServerClass = http.server.HTTPServer
+    # Threaded: a slow or unreachable hub must not block health probes or
+    # requests from other devices behind it.
+    ServerClass = http.server.ThreadingHTTPServer
 
-    httpd = ServerClass(('', SERVER_PORT), HandlerClass)
+    try:
+        httpd = ServerClass((str(SERVER_IP), SERVER_PORT), HandlerClass)
+    except OSError as error :
+        log.error (f'ERROR: cannot initialize Server; {error}')
+        log.warn (f'Invalid IP address or Port {SERVER_PORT} may be in use by another application\n')
+        httpd = False
 
     if httpd:
-        # Trick to get our IP address
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        myipAddress =  s.getsockname()[0]
-        s.close()
+        if SERVER_IP == '':
+            # Trick to get our IP address. Display only, and best-effort: there
+            # may be no route out at all (restricted egress), which must not
+            # stop the server from starting.
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                SERVER_IP =  s.getsockname()[0]
+                s.close()
+            except OSError:
+                SERVER_IP = '0.0.0.0'
 
-        print (f"\n\033[97mForwarding Bridge Server v{VERSION} (for SmartThings Edge)\033[0m")
-        print (f"\033[94m > Serving HTTP on {myipAddress}:{SERVER_PORT}\033[0m\n")
+        shutdown_signal = []
 
-        try: 
+        def _handle_shutdown(signum, frame):
+            # Deliberately no logging here. A signal can arrive midway through
+            # a write to stdout, and printing from the handler then re-enters
+            # the buffer and raises "reentrant call inside BufferedWriter".
+            # Record the signal and let the main path report it once the
+            # serve_forever() loop has exited.
+            if shutdown_signal:
+                return
+            shutdown_signal.append(signum)
+            # shutdown() blocks until serve_forever() returns, so it cannot be
+            # called from the thread running it - hand off to a helper thread.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
+
+        log.hilite (f"Forwarding Bridge Server v{VERSION} (for SmartThings Edge)")
+        log.hilite (f" > Serving HTTP on {SERVER_IP}:{SERVER_PORT}")
+
+        try:
             httpd.serve_forever()    # wait for, and process HTTP requests
 
         except KeyboardInterrupt:
-            print ('\n\033[92mINFO: Action interrupted by user...\033[0m\n')
-    else:
-        print ('\n\033[91mERROR: cannot initialize Server\033[0m\n')
+            log.warn ('INFO: Application interrupted by user...\n')
+
+        if shutdown_signal:
+            log.warn (f'INFO: Received signal {shutdown_signal[0]}; shutting down...\n')
+
+        httpd.server_close()

@@ -1,5 +1,8 @@
 .registrations
 
+# Local agent guidance, kept out of the published repo.
+CLAUDE.md
+
 # Real config carries the SmartThings bearer token. Only the .example is tracked.
 docker/edgebridge.cfg
 *.log

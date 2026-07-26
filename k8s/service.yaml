@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: edgebridge
+  labels:
+    app.kubernetes.io/name: edgebridge
+  annotations:
+    # Edge drivers register a fixed edgebridge address, so this IP must be
+    # stable. Pin it with whatever your load balancer implementation uses -
+    # this example is MetalLB.
+    metallb.universe.tf/loadBalancerIPs: "192.168.1.88"
+spec:
+  type: LoadBalancer
+
+  # REQUIRED, not a tuning knob.
+  #
+  # edgebridge decides which Edge driver an inbound message belongs to by
+  # matching the *source IP* of the request against its registration table
+  # (proc_registered_requests in edgebridge.py). With the default
+  # externalTrafficPolicy of Cluster, kube-proxy SNATs inbound traffic to a node
+  # IP, every device's source address becomes the node, no registration matches,
+  # and inbound messages are silently dropped.
+  #
+  # `Local` preserves the original client IP. The trade-off is that only nodes
+  # running a pod will accept traffic, which is fine at replicas: 1.
+  externalTrafficPolicy: Local
+
+  selector:
+    app.kubernetes.io/name: edgebridge
+  ports:
+    - name: http
+      port: 8088
+      targetPort: http
+      protocol: TCP

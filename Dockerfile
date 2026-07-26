@@ -4,10 +4,11 @@
 # a bind mount under Docker). Baking it into a layer would make it recoverable
 # by anyone who can pull the image.
 
-ARG PYTHON_IMAGE=python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
-
-# hadolint ignore=DL3006  # base is digest-pinned in the ARG default above
-FROM ${PYTHON_IMAGE} AS build
+# The base image is written out in full in both stages rather than carried in an
+# ARG. hadolint cannot resolve an ARG back to its default and reports the base
+# as untagged, and fighting that with ignore directives is more fragile than the
+# small duplication. Keep the two digests identical when bumping.
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS build
 
 WORKDIR /app
 COPY requirements.txt .
@@ -15,8 +16,7 @@ RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 
-# hadolint ignore=DL3006  # base is digest-pinned in the ARG default above
-FROM ${PYTHON_IMAGE}
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
 
 ARG VERSION=0.0.0-dev
 ARG REVISION=unknown

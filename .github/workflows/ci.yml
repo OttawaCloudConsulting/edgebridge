@@ -77,15 +77,26 @@ jobs:
             -v "$PWD:/scan" -w /scan "$BETTERLEAKS_IMAGE" \
             git . -v --report-format sarif --report-path betterleaks-git.sarif
 
-      - name: Upload results
+      # Each report needs its own category. Uploading both under one category
+      # is rejected outright ("does not support uploading multiple SARIF runs
+      # with the same category") and nothing reaches the Security tab.
+      - name: Upload working tree results
         # Runs even when a scan failed, so findings are visible in the
         # Security tab rather than only in the job log.
         if: always()
         continue-on-error: true   # forked PRs cannot write security events
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: .
-          category: betterleaks
+          sarif_file: betterleaks-dir.sarif
+          category: betterleaks-dir
+
+      - name: Upload git history results
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: betterleaks-git.sarif
+          category: betterleaks-git
 
   build:
     runs-on: ubuntu-latest

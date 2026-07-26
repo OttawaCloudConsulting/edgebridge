@@ -28,14 +28,15 @@ import http.server
 import datetime
 import time
 import socket
-from typing import TYPE_CHECKING
 import requests
 import os
-import sys
 import platform
 import configparser
 import json
 import ipaddress
+import argparse
+import signal
+import threading
 
 registrations = []
 hubsenderrors = {}
@@ -52,6 +53,22 @@ DEFAULT_ST_TOKEN = ''
 SERVER_PORT = DEFAULT_SERVERPORT
 SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
 FWTIMEOUT = 5
+
+# Set once from the command line; read by logger.debug on every call
+DEBUG = False
+
+# Directory the '.registrations' file is written to. Kept separate from the config
+# path so the config can be mounted read-only (e.g. a Kubernetes Secret volume)
+# while state still lands somewhere writable.
+STATE_DIR = '.'
+
+# Health endpoint for container orchestrators. GET only, unlogged, and matched
+# before registration lookup so a probe from a registered source IP is never
+# forwarded to a hub.
+HEALTH_PATHS = ('/healthz', '/readyz')
+
+REDACTED = '<redacted>'
+SENSITIVE_HEADERS = ('authorization', 'proxy-authorization')
 
 
 class logger(object):
@@ -79,9 +96,9 @@ class logger(object):
             f.write(f'{time.strftime("%c")}  {msg}\n')
     
     def __outputmsg(self, colormsg, plainmsg):
-        
+
         if self.toconsole:
-            print (colormsg)
+            print (colormsg, flush=True)
         if self.savetofile:
             self.__savetofile(plainmsg)
     
@@ -102,10 +119,34 @@ class logger(object):
         self.__outputmsg(colormsg, msg)
         
     def debug(self, msg):
-        if len(sys.argv) > 1:
-            if sys.argv[1] == '-d':
-                colormsg = f'\033[33m{time.strftime("%c")}  \033[37m{msg}\033[0m'
-                self.__outputmsg(colormsg, msg)
+        if DEBUG:
+            colormsg = f'\033[33m{time.strftime("%c")}  \033[37m{msg}\033[0m'
+            self.__outputmsg(colormsg, msg)
+
+
+def redact_headers(headers):
+    """Copy of 'headers' with credential values masked, for safe logging.
+
+    proc_forward attaches the SmartThings bearer token to outbound requests;
+    without this the token would be written verbatim to the debug log.
+    """
+    return {key: (REDACTED if key.lower() in SENSITIVE_HEADERS else value)
+            for key, value in headers.items()}
+
+
+def parse_args(argv=None):
+
+    parser = argparse.ArgumentParser(
+        prog='edgebridge',
+        description='Forwarding bridge server for SmartThings Edge drivers')
+    parser.add_argument('-d', '--debug', action='store_true',
+                        help='enable debug-level logging')
+    parser.add_argument('-c', '--config', default=CONFIGFILENAME,
+                        help=f'path to the config file (default: ./{CONFIGFILENAME})')
+    parser.add_argument('-s', '--state-dir', default='.',
+                        help=f'writable directory for the {REGSFILENAME} file (default: current directory)')
+
+    return parser.parse_args(argv)
 
 
 def http_response(server, code, responsetosend):
@@ -115,7 +156,7 @@ def http_response(server, code, responsetosend):
         if len(responsetosend) > 0:
             server.send_header("Content-Type", 'text/xml; charset="utf-8"')
             server.send_header("Content-Length", str(len(bytes(responsetosend, 'UTF-8'))))
-        server.send_header("Date", datetime.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT"))
+        server.send_header("Date", datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"))
         server.send_header("Server", 'edgeBridge')
         
         server.end_headers()
@@ -165,26 +206,33 @@ def proc_forward (server, method, path, arg):
         
         headers = build_headers(server, path)
                 
-        log.debug (f'Headers: {headers}')
+        log.debug (f'Headers: {redact_headers(headers)}')
         if server.data_bytes:
             log.debug (f'Body: {server.data_bytes.decode("utf-8")}')
         
+        lc_method = method.lower()
+        if lc_method not in ['post', 'put', 'get']:
+            log.error (f'Unsupported method for forward command: {method}')
+            http_response(server, 405, "")
+            return
+
         try:
-            lc_method = method.lower()
-            if lc_method in ['post', 'put', 'get']:
-                r = getattr(requests, lc_method)(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
-            
-            #if method in ['post', 'Post', 'POST']:
-            #    r = requests.post(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
-            #elif method in ['put', 'Put', 'PUT']:
-            #    r = requests.put(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
-            #elif method in ['get', 'Get', 'GET']:
-            #    r = requests.get(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
+            r = getattr(requests, lc_method)(url, data=server.data_bytes, headers=headers, timeout=FWTIMEOUT)
         except requests.Timeout:
             log.error ("Internet request timed out")
             http_response(server, 502, "")
             return
-            
+        except requests.RequestException as e:
+            # Anything else the request layer can raise - DNS failure, connection
+            # refused, TLS error. Without this the exception escapes the handler
+            # and the Edge driver never receives a response at all.
+            # Only the exception type is logged: the message embeds the URL,
+            # which may carry credentials in its query string.
+            log.error (f'Forwarding request failed: {e.__class__.__name__}')
+            http_response(server, 502, "")
+            return
+
+
         if r.status_code == HTTP_OK:
             
             log.debug (f'Returned data: {r.text}')
@@ -244,7 +292,7 @@ def passto_hub(server, regrecord):
         log.info (f'Sending POST: {url} to {hubaddr}')
 
         try:
-            r = requests.post(url, headers=headers, data=server.data_bytes)
+            r = requests.post(url, headers=headers, data=server.data_bytes, timeout=FWTIMEOUT)
 
             if r.status_code == 200:
                 log.info (f"Message forwarded to Edge ID {regrecord['edgeid']}")
@@ -322,7 +370,7 @@ def find_reg(reglist, devaddr, edgeid):
 
 def read_regs(regs_filename):
 
-    file_path = os.getcwd() + os.path.sep + regs_filename
+    file_path = os.path.join(STATE_DIR, regs_filename)
 
     try:
         with open(file_path,"r") as f1:
@@ -339,7 +387,7 @@ def read_regs(regs_filename):
 
 def write_regs(regs_filename, reglist):
 
-    file_path = os.getcwd() + os.path.sep + regs_filename
+    file_path = os.path.join(STATE_DIR, regs_filename)
 
     try:
         with open(file_path, 'w') as f1:
@@ -506,9 +554,15 @@ class myHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         
         
     def do_GET(self):
-        
+
+        # Health probe. Matched before proc_msg so that a probe originating from
+        # an IP that happens to be a registered device is not relayed to a hub.
+        if self.path.split('?')[0] in HEALTH_PATHS:
+            http_response(self, 200, "")
+            return
+
         proc_msg(self)
-        
+
 
     def do_DELETE(self):
         
@@ -519,13 +573,14 @@ class myHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         return
 
 
-def process_config(config_filename):
+def process_config(config_path):
 
     global SERVER_PORT
     global SERVER_IP
     global SMARTTHINGS_TOKEN
+    global FWTIMEOUT
     global log
-    
+
     SERVER_IP = ''
     SERVER_PORT = DEFAULT_SERVERPORT
     SMARTTHINGS_TOKEN = DEFAULT_ST_TOKEN
@@ -533,7 +588,7 @@ def process_config(config_filename):
     logoutp = False
     LOGFILE = ''
 
-    CONFIG_FILE_PATH = os.getcwd() + os.path.sep + config_filename
+    CONFIG_FILE_PATH = config_path
 
     parser = configparser.ConfigParser()
     if parser.read(CONFIG_FILE_PATH):
@@ -603,12 +658,17 @@ if __name__ == '__main__':
     if thisOS == 'Windows':
         os.system('color')              # force color text to work in Windows
 
+    args = parse_args()
+    DEBUG = args.debug
+    STATE_DIR = args.state_dir
 
-    process_config(CONFIGFILENAME)
+    process_config(args.config)
     registrations = read_regs(REGSFILENAME)
 
     HandlerClass = myHTTPRequestHandler
-    ServerClass = http.server.HTTPServer
+    # Threaded: a slow or unreachable hub must not block health probes or
+    # requests from other devices behind it.
+    ServerClass = http.server.ThreadingHTTPServer
 
     try:
         httpd = ServerClass((str(SERVER_IP), SERVER_PORT), HandlerClass)
@@ -619,17 +679,33 @@ if __name__ == '__main__':
 
     if httpd:
         if SERVER_IP == '':
-            # Trick to get our IP address
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            SERVER_IP =  s.getsockname()[0]
-            s.close()
+            # Trick to get our IP address. Display only, and best-effort: there
+            # may be no route out at all (restricted egress), which must not
+            # stop the server from starting.
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                SERVER_IP =  s.getsockname()[0]
+                s.close()
+            except OSError:
+                SERVER_IP = '0.0.0.0'
+
+        # shutdown() blocks until serve_forever() returns, so it cannot be
+        # called from the thread running it - hand off to a helper thread.
+        def _handle_shutdown(signum, frame):
+            log.warn (f'INFO: Received signal {signum}; shutting down...\n')
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
 
         log.hilite (f"Forwarding Bridge Server v{VERSION} (for SmartThings Edge)")
         log.hilite (f" > Serving HTTP on {SERVER_IP}:{SERVER_PORT}")
 
-        try: 
+        try:
             httpd.serve_forever()    # wait for, and process HTTP requests
 
         except KeyboardInterrupt:
             log.warn ('INFO: Application interrupted by user...\n')
+
+        httpd.server_close()

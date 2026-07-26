@@ -3,7 +3,6 @@
 import responses
 
 import edgebridge
-
 from conftest import FakeServer
 
 ST_PATH = '/api/forward?url=https://api.smartthings.com/v1/devices'

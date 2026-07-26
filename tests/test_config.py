@@ -1,7 +1,6 @@
 """Config parsing, including the settings that used to be silently ignored."""
 
 import edgebridge
-
 from conftest import TEST_TOKEN, write_cfg
 
 

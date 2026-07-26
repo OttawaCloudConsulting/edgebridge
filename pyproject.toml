@@ -3,11 +3,16 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-# Deliberately close to ruff's defaults. This is a legacy single-file app kept
-# close to upstream; a wide rule set would bury real problems under style churn.
-# Everything ignored here is pre-existing upstream style, not new code. The
-# pyflakes (F) rules stay on, which is what catches genuine mistakes such as
-# undefined names and unused imports.
+# The rule set is stated explicitly rather than inherited from ruff's defaults.
+# Those defaults grow between releases, so an unpinned lint step can fail CI on
+# a commit that changed nothing - which is exactly what happened once already.
+# Widen this deliberately, not by upgrading.
+select = ["E4", "E7", "E9", "F", "I"]
+
+# All of these are pre-existing upstream style, not new code. This is a legacy
+# single-file app kept close to upstream, and reformatting it would bury real
+# problems under churn. The pyflakes (F) rules stay on, which is what catches
+# genuine mistakes such as undefined names and unused imports.
 ignore = [
     "E722",  # bare 'except:' - pervasive upstream style, see CLAUDE.md
     "E402",  # imports below the VERSION constant - upstream file layout
@@ -18,7 +23,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]  # asserts are the point
+"edgebridge.py" = ["I001"]  # upstream import order, left as-is
+"tests/*" = ["S101"]        # asserts are the point
+
+[tool.ruff.lint.isort]
+known-first-party = ["edgebridge", "conftest"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

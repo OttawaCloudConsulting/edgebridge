@@ -25,8 +25,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+          cache: pip
 
-      - run: pip install ruff
+      # Installed from requirements-dev.txt rather than `pip install ruff` so
+      # the linter version matches local development. An unpinned install lets
+      # a ruff release fail CI on a commit that changed nothing.
+      - run: pip install -r requirements-dev.txt
       - run: ruff check .
 
       - name: Lint Dockerfile

@@ -3,7 +3,6 @@
 import os
 
 import edgebridge
-
 from conftest import FakeServer
 
 EDGEID = '3894be52-09e8-4cfd-ad5c-580de59b6873'

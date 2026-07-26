@@ -21,15 +21,26 @@ CFG_TEMPLATE = """[config]
 Server_Port = {port}
 SmartThings_Bearer_Token = {token}
 forwarding_timeout = {timeout}
-console_output = no
-logfile_output = no
+console_output = {console_output}
+logfile_output = {logfile_output}
 """
 
 
-def write_cfg(tmp_path, port=8088, token=TEST_TOKEN, timeout=5, extra=''):
-    """Write a config file and return its path as a string."""
+def write_cfg(tmp_path, port=8088, token=TEST_TOKEN, timeout=5,
+              console_output='no', logfile_output='no', logfile=None, extra=''):
+    """Write a config file and return its path as a string.
+
+    Logging options are parameters rather than something to append via `extra`;
+    configparser rejects a duplicated key outright.
+    """
+    body = CFG_TEMPLATE.format(port=port, token=token, timeout=timeout,
+                               console_output=console_output,
+                               logfile_output=logfile_output)
+    if logfile is not None:
+        body += f'logfile = {logfile}\n'
+
     cfg = tmp_path / 'edgebridge.cfg'
-    cfg.write_text(CFG_TEMPLATE.format(port=port, token=token, timeout=timeout) + extra)
+    cfg.write_text(body + extra)
     return str(cfg)
 
 

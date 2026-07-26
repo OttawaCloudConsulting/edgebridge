@@ -91,9 +91,21 @@ class logger(object):
                     pass
             
     def __savetofile(self, msg):
-        
-        with open(self.filename, 'a') as f:
-            f.write(f'{time.strftime("%c")}  {msg}\n')
+
+        try:
+            with open(self.filename, 'a') as f:
+                f.write(f'{time.strftime("%c")}  {msg}\n')
+        except OSError as e:
+            # Logging must never take the server down. Fall back to console only
+            # and report once, rather than raising on every subsequent message.
+            self.savetofile = False
+            self.toconsole = True
+            print(f'\033[91mLog file {self.filename!r} is not writable ({e.__class__.__name__}); '
+                  f'continuing with console output only\033[0m', flush=True)
+            # __outputmsg has already decided whether to print, and with console
+            # output disabled it skipped this message before calling us. Emit it
+            # here so the message that triggered the failure is not lost.
+            print(f'{time.strftime("%c")}  {msg}', flush=True)
     
     def __outputmsg(self, colormsg, plainmsg):
 
@@ -636,13 +648,24 @@ def process_config(config_path):
                 conoutp = False
 
             if parser.get('config', 'logfile_output').lower() == 'yes':
-                logoutp = True
-                LOGFILE = parser.get('config', 'logfile')
+                # Only enable file logging once a usable path has actually been
+                # read. Setting the flag first meant a missing 'logfile' key
+                # left an empty filename behind, and the first log message then
+                # killed the process on open('').
+                LOGFILE = parser.get('config', 'logfile', fallback='').strip()
+                logoutp = bool(LOGFILE)
+                if not logoutp:
+                    print ('\033[93mlogfile_output is enabled but no logfile was specified; '
+                           'using console output only\033[0m')
+                    conoutp = True
             else:
                 logoutp = False
                 LOGFILE = ''
         except:
             print ('Using output config defaults')
+            conoutp = True
+            logoutp = False
+            LOGFILE = ''
             
     log = logger(conoutp, logoutp, LOGFILE, False)
     
@@ -690,10 +713,19 @@ if __name__ == '__main__':
             except OSError:
                 SERVER_IP = '0.0.0.0'
 
-        # shutdown() blocks until serve_forever() returns, so it cannot be
-        # called from the thread running it - hand off to a helper thread.
+        shutdown_signal = []
+
         def _handle_shutdown(signum, frame):
-            log.warn (f'INFO: Received signal {signum}; shutting down...\n')
+            # Deliberately no logging here. A signal can arrive midway through
+            # a write to stdout, and printing from the handler then re-enters
+            # the buffer and raises "reentrant call inside BufferedWriter".
+            # Record the signal and let the main path report it once the
+            # serve_forever() loop has exited.
+            if shutdown_signal:
+                return
+            shutdown_signal.append(signum)
+            # shutdown() blocks until serve_forever() returns, so it cannot be
+            # called from the thread running it - hand off to a helper thread.
             threading.Thread(target=httpd.shutdown, daemon=True).start()
 
         signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -707,5 +739,8 @@ if __name__ == '__main__':
 
         except KeyboardInterrupt:
             log.warn ('INFO: Application interrupted by user...\n')
+
+        if shutdown_signal:
+            log.warn (f'INFO: Received signal {shutdown_signal[0]}; shutting down...\n')
 
         httpd.server_close()
